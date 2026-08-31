@@ -257,10 +257,18 @@
   /* ==================== 转存执行 ==================== */
 
   /**
-   * 转存一批：定位/创建目标目录 → 发起转存 → 轮询任务直到完成
+   * 读取用户填写的目标路径，归一化为无首尾斜杠的相对路径段（"/" 或空 = 根目录）
+   */
+  function destPrefix() {
+    const v = (document.getElementById('qbs-dest').value || '/').trim();
+    return v.replace(/^\/+|\/+$/g, '');
+  }
+
+  /**
+   * 转存一批：定位/创建目标目录（用户目标路径 + 分享内相对路径）→ 发起转存 → 轮询任务直到完成
    */
   async function runBatch(b) {
-    const toFid = await ensureDir(b.relPath);
+    const toFid = await ensureDir([destPrefix(), b.relPath].filter(Boolean).join('/'));
     await gap();
     const d = await req('POST', `${API}/share/sharepage/save?${COMMON}`, {
       fid_list: b.items.map((i) => i.fid),
