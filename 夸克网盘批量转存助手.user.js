@@ -2,7 +2,7 @@
 // @name         夸克网盘批量转存助手
 // @namespace    quark-batch-save
 // @version      0.1.0
-// @description  自动分批转存夸克分享（每批≤300文件），保留目录结构，失败批次可重试/拆半重试
+// @description  自动分批转存夸克分享，比对去重跳过已存在文件，保留目录结构，失败批次可重试
 // @match        https://pan.quark.cn/s/*
 // @noframes
 // @run-at       document-idle
@@ -16,10 +16,11 @@
   /* ==================== 配置 ==================== */
   const API = 'https://drive-pc.quark.cn/1/clouddrive'; // 夸克 PC 网页端接口基址
   const COMMON = 'pr=ucpro&fr=pc';                      // 网页端固定查询参数
-  const DEFAULT_BATCH = 200;  // 每批最大文件数（含文件夹内文件，官方上限500，留余量）
+  const DEFAULT_BATCH = 200;  // 每批最大节点数（文件+文件夹，官方上限500，留余量）
   const PAGE_SIZE = 50;       // 文件列表分页大小（夸克服务端实际每页固定 50，请求更大也会被截断）
   const REQ_GAP = 350;        // 相邻请求最小间隔(ms)，避免触发风控
-  const TASK_TIMEOUT = 120;   // 单批转存任务轮询上限(秒)
+  const TASK_TIMEOUT = 120;   // 单批转存任务轮询上限(秒)，大文件夹递归转存较慢
+  const DRILLDOWN_THRESHOLD = 150; // 单个文件夹节点数超过此值即下钻拆分（避免单批处理过久超时）
 
   /* ==================== 运行时状态 ==================== */
   const S = {
@@ -334,102 +335,32 @@
   }
 
   /**
-   * 把 items 列表按 batchSize（递归节点数上限）拆成多个批次。
-   * 夸克对文件夹会递归转存，所以单个文件夹的权重是其递归节点数。
-   * 单个 item 的节点数若超过 batchSize，调用方应已先下钻处理，此处不再拆分单个 item。
+   * 裁剪分享树：与目标网盘已有内容逐级比对，返回裁剪后的新树（不修改原树）。
+   * - 同名文件已存在 → 跳过
+   * - 同名文件夹已存在 → 递归深入，只保留缺失子项
+   * - 名称不存在 → 整体保留转存
+   * 裁剪后的树只含需要转存的内容，planBatches 按 countNodes 分批即可。
    */
-  function splitItems(items, relPath, srcPdirFid, batchSize) {
-    const batches = [];
-    let curItems = [], curLeaves = 0, curNodes = 0;
-    for (const item of items) {
-      const w = countNodes(item);
-      if (curItems.length && curNodes + w > batchSize) {
-        batches.push({ relPath, srcPdirFid, items: curItems, leaves: curLeaves });
-        curItems = []; curLeaves = 0; curNodes = 0;
-      }
-      curItems.push(item);
-      curNodes += w;
-      curLeaves += item.isDir ? countLeaves(item) : 1;
-    }
-    if (curItems.length) batches.push({ relPath, srcPdirFid, items: curItems, leaves: curLeaves });
-    return batches;
-  }
-
-  /**
-   * 递归对比分享侧文件夹与目标侧同名文件夹，返回需要转存的批次列表。
-   * - 子文件同名已存在 → 跳过
-   * - 子文件夹同名已存在 → 递归深入
-   * - 子文件夹不存在且叶子数 ≤ batchSize → 整体作为 item 转存
-   * - 子文件夹不存在但叶子数 > batchSize → 下钻展开（targetFid 传 null，所有子项直接转存）
-   * 返回的批次均按 batchSize 拆分，relPath 已包含完整相对路径。
-   */
-  async function diffFolder(srcDir, targetFid, baseRelPath, batchSize) {
+  async function diffTree(srcNode, targetFid) {
+    if (!srcNode.isDir) return srcNode;
     const existing = await loadTargetDir(targetFid);
-    const directItems = []; // 当前层级可直接转存的 items（目标路径 = baseRelPath）
-    const batches = [];
-    for (const child of srcDir.children) {
+    const newChildren = [];
+    for (const child of srcNode.children) {
       const hit = existing.get(child.name);
       if (child.isDir) {
         if (hit && hit.isDir) {
-          // 同名文件夹已存在 → 递归深入，缺失子项的 relPath 加上该层
-          const subBatches = await diffFolder(child, hit.fid, baseRelPath ? `${baseRelPath}/${child.name}` : child.name, batchSize);
-          batches.push(...subBatches);
-        } else if (countNodes(child) > batchSize) {
-          // 文件夹不存在但递归节点数超限 → 下钻展开（目标侧无此目录，子项全部直接转存）
-          const subBatches = await diffFolder(child, null, baseRelPath ? `${baseRelPath}/${child.name}` : child.name, batchSize);
-          batches.push(...subBatches);
+          // 同名文件夹已存在 → 下钻对比，只保留缺失子项
+          const sub = await diffTree(child, hit.fid);
+          if (sub && sub.children.length) newChildren.push(sub);
         } else {
-          // 文件夹不存在且不超限 → 整体转存
-          directItems.push(child);
+          newChildren.push(child); // 文件夹不存在 → 整体转存
         }
       } else {
-        // 文件：同名已存在则跳过
-        if (hit && !hit.isDir) continue;
-        directItems.push(child);
+        if (hit && !hit.isDir) continue; // 同名文件已存在 → 跳过
+        newChildren.push(child);
       }
     }
-    // 按 batchSize 拆分当前层的直接转存项，避免单次 save 超限
-    batches.push(...splitItems(directItems, baseRelPath, srcDir.fid, batchSize));
-    return batches;
-  }
-
-  /**
-   * 对单个批次做去重过滤：
-   * - 文件同名已存在 → 跳过
-   * - 文件夹同名已存在 → 深入比对，把缺失子项展开为新批次插入队列
-   * - 文件夹不存在 → 整体保留转存
-   * 返回当前批次过滤后是否还有剩余项。
-   */
-  async function dedupBatch(b) {
-    const toFid = await ensureDir([destPrefix(), b.relPath].filter(Boolean).join('/'));
-    const existing = await loadTargetDir(toFid);
-    const batchSize = Math.max(1, Math.min(500, Number(document.getElementById('qbs-size').value) || DEFAULT_BATCH));
-    const kept = [];
-    const extraBatches = [];
-    for (const item of b.items) {
-      const hit = existing.get(item.name);
-      if (item.isDir) {
-        if (hit && hit.isDir) {
-          // 同名文件夹已存在 → 深入比对，缺失子项展开为新批次（已按 batchSize 拆分）
-          const subBatches = await diffFolder(item, hit.fid, b.relPath ? `${b.relPath}/${item.name}` : item.name, batchSize);
-          extraBatches.push(...subBatches);
-        } else {
-          kept.push(item);
-        }
-      } else {
-        if (hit && !hit.isDir) continue;
-        kept.push(item);
-      }
-    }
-    b.items = kept;
-    b.leaves = kept.reduce((s, i) => s + (i.isDir ? countLeaves(i) : 1), 0);
-    // 展开的新批次插入到当前批次之后，relPath 已含完整路径
-    if (extraBatches.length) {
-      const idx = S.batches.indexOf(b);
-      const newBatches = extraBatches.map((nb) => ({ ...nb, status: 'pending', error: '' }));
-      S.batches.splice(idx + 1, 0, ...newBatches);
-    }
-    return kept.length > 0;
+    return { ...srcNode, children: newChildren };
   }
 
   /**
@@ -474,10 +405,13 @@
       let cur = null;
       const newBatch = () => ({ relPath, srcPdirFid, items: [], leaves: 0, nodes: 0, status: 'pending', error: '' });
       const flush = () => { if (cur && cur.items.length) out.push(cur); cur = null; };
+      // 下钻阈值：取 batchSize 和 DRILLDOWN_THRESHOLD 的较小值
+      // 即使未超 batchSize，单文件夹节点过多也会导致转存超时，需拆分
+      const drillLimit = Math.min(batchSize, DRILLDOWN_THRESHOLD);
       for (const child of children) {
         const w = countNodes(child);
-        // 超大文件夹：递归节点数超限 → 下钻到子级
-        if (child.isDir && w > batchSize) {
+        // 超大文件夹：递归节点数超阈值 → 下钻到子级
+        if (child.isDir && w > drillLimit) {
           flush();
           const rp = relPath ? `${relPath}/${child.name}` : child.name;
           walk(child.children, rp, child.fid);
@@ -506,14 +440,10 @@
   }
 
   /**
-   * 转存一批：先去重（开关开启时）→ 定位/创建目标目录 → 发起转存 → 轮询任务直到完成
+   * 转存一批：定位/创建目标目录 → 发起转存 → 轮询任务直到完成
+   * 去重已在整体比对阶段（diffTree）完成，此处直接转存
    */
   async function runBatch(b) {
-    // 重试场景下也做去重：批次可能部分已转存成功，跳过已存在的防止重复
-    if (dedupEnabled()) {
-      const hasItems = await dedupBatch(b);
-      if (!hasItems) return true; // 全部已存在，视为成功
-    }
     const toFid = await ensureDir([destPrefix(), b.relPath].filter(Boolean).join('/'));
     await gap();
     const d = await req('POST', `${API}/share/sharepage/save?${COMMON}`, {
@@ -525,7 +455,14 @@
       pdir_fid: b.srcPdirFid,
       scene: 'link',
     });
-    if (d.task_id == null) return true; // 部分版本同步返回即成功
+    // save 接口可能同步返回成功（无 task_id）或返回 task_id 需轮询
+    // 若返回了错误字段，不能误判为成功
+    if (d.task_id == null) {
+      if (d.status && Number(d.status) > 2) {
+        throw new Error(`转存失败：${d.message || d.task_title || JSON.stringify(d).slice(0, 200)}`);
+      }
+      return true;
+    }
     return pollTask(d.task_id);
   }
 
@@ -572,49 +509,24 @@
     }
     const savedFiles = S.batches.filter((b) => b.status === 'ok').reduce((s, b) => s + b.leaves, 0);
     setStatus(fail
-      ? `完成：成功 ${ok} 批，失败 ${fail} 批。可对失败批次重试或拆半重试。`
+      ? `完成：成功 ${ok} 批，失败 ${fail} 批。可对失败批次点「重试」，或点「重试未完成」整体重跑。`
       : `全部完成：${ok} 批转存成功，共 ${savedFiles} 个文件已保存到目标路径。`);
   }
 
   /**
-   * 重试单个批次及其去重时展开的后续批次
-   * （dedupBatch 可能把目标侧已存在的同名文件夹展开为多个新批次插入到当前批次之后）
+   * 重试单个批次：直接转存，不做去重比对（用户手动确认需要重试该批次）
    */
   async function rerunBatch(b) {
     if (S.running || b.status === 'ok') return;
     S.running = true;
     setBusy(true);
-    const startIdx = S.batches.indexOf(b);
-    try {
-      for (let i = startIdx; i < S.batches.length; i++) {
-        const cur = S.batches[i];
-        if (cur.status === 'ok') continue;
-        cur.status = 'running'; cur.error = '';
-        renderBatches();
-        try { await runBatch(cur); cur.status = 'ok'; }
-        catch (e) { cur.status = 'failed'; cur.error = e.message; }
-        renderBatches();
-      }
-    } finally {
-      S.running = false;
-      setBusy(false);
-    }
-  }
-
-  /**
-   * 拆半重试：把失败批次一分为二（目标路径不变），原批次被替换成两个新批次
-   */
-  function splitBatch(b) {
-    if (b.items.length < 2) return false;
-    const idx = S.batches.indexOf(b);
-    const mk = (items) => ({
-      relPath: b.relPath, srcPdirFid: b.srcPdirFid, items,
-      leaves: items.reduce((s, i) => s + (i.isDir ? countLeaves(i) : 1), 0),
-      status: 'pending', error: '',
-    });
-    const mid = Math.ceil(b.items.length / 2);
-    S.batches.splice(idx, 1, mk(b.items.slice(0, mid)), mk(b.items.slice(mid)));
-    return true;
+    b.status = 'running'; b.error = '';
+    renderBatches();
+    try { await runBatch(b); b.status = 'ok'; }
+    catch (e) { b.status = 'failed'; b.error = e.message; }
+    renderBatches();
+    S.running = false;
+    setBusy(false);
   }
 
   /* ==================== UI ==================== */
@@ -739,23 +651,55 @@
       if (S.batches.length && S.plannedKey !== planKey(size) &&
           S.batches.some((b) => b.status === 'ok') &&
           !confirm('修改每批数量将重新规划并清空已有进度，可能造成重复转存。确定继续？')) return;
-      // 去重改为分批执行：每个批次转存前由 runBatch 内的 dedupBatch 处理，
-      // 避免启动时一次性扫描整棵树造成的长时间等待
-      replan(size);
       S.running = true;
       setBusy(true);
-      try { await runAll(); }
-      finally { S.running = false; setBusy(false); }
+      try {
+        // 整体比对 → 分批 → 转存
+        let tree = S.tree;
+        if (dedupEnabled()) {
+          setStatus('正在比对目标网盘已有文件，跳过已存在内容…');
+          try {
+            targetCache.clear(); // 清除缓存，确保比对用最新的目标网盘状态
+            const destFid = await ensureDir(destPrefix());
+            const diffed = await diffTree(S.tree, destFid);
+            const skipped = countLeaves(S.tree) - countLeaves(diffed);
+            tree = diffed;
+            if (skipped > 0) setStatus(`比对完成：跳过 ${skipped} 个已存在文件。`);
+          } catch (e) {
+            setStatus('比对失败（将按全量转存）：' + e.message);
+          }
+        }
+        replan(size, tree);
+        await runAll();
+      } finally { S.running = false; setBusy(false); }
     });
 
     document.getElementById('qbs-retry').addEventListener('click', async () => {
       if (S.running) return;
       const todo = S.batches.filter((b) => b.status !== 'ok');
       if (!todo.length) return setStatus('没有需要重试的批次。');
+      const size = Math.max(1, Math.min(500, Number(document.getElementById('qbs-size').value) || DEFAULT_BATCH));
       S.running = true;
       setBusy(true);
-      try { await runAll(); }
-      finally { S.running = false; setBusy(false); }
+      try {
+        // 重试未完成：同样先整体比对 → 重新分批 → 转存
+        let tree = S.tree;
+        if (dedupEnabled()) {
+          setStatus('正在比对目标网盘已有文件，跳过已存在内容…');
+          try {
+            targetCache.clear(); // 清除缓存：上次转存可能新增了文件，必须重新加载
+            const destFid = await ensureDir(destPrefix());
+            const diffed = await diffTree(S.tree, destFid);
+            const skipped = countLeaves(S.tree) - countLeaves(diffed);
+            tree = diffed;
+            if (skipped > 0) setStatus(`比对完成：跳过 ${skipped} 个已存在文件。`);
+          } catch (e) {
+            setStatus('比对失败（将按全量转存）：' + e.message);
+          }
+        }
+        replan(size, tree);
+        await runAll();
+      } finally { S.running = false; setBusy(false); }
     });
 
     document.getElementById('qbs-export').addEventListener('click', exportJSON);
@@ -787,19 +731,20 @@
   function planKey(size) { return `${S.tree ? 'tree' : ''}:${size}`; }
 
   /**
-   * （重新）生成分批计划并刷新列表
+   * （重新）生成分批计划并刷新列表；传入 tree 时用裁剪后的树（去重），否则用原始扫描树
    */
-  function replan(size) {
+  function replan(size, tree) {
     size = size || Math.max(1, Math.min(500, Number(document.getElementById('qbs-size').value) || DEFAULT_BATCH));
-    S.batches = planBatches(S.tree, size);
+    const t = tree || S.tree;
+    S.batches = planBatches(t, size);
     S.plannedKey = planKey(size);
     renderBatches();
-    const files = countLeaves(S.tree);
-    setStatus(`共 ${files} 个文件待转存，将分 ${S.batches.length} 批转存（每批 ≤${size} 文件）。`);
+    const files = countLeaves(t);
+    setStatus(`共 ${files} 个文件待转存，将分 ${S.batches.length} 批转存（每批 ≤${size} 个节点）。`);
   }
 
   /**
-   * 渲染批次列表：状态着色，失败批次带重试/拆半按钮
+   * 渲染批次列表：状态着色，未成功批次带重试按钮
    */
   function renderBatches() {
     const box = document.getElementById('qbs-batches');
@@ -817,14 +762,13 @@
       const lbl = document.createElement('span');
       lbl.className = 'qbs-lbl';
       const st = { pending: '待转存', running: '转存中…', ok: '成功', failed: '失败' }[b.status] || b.status;
-      lbl.textContent = `#${i + 1} [${b.relPath || '/'}] ${b.items.length}项/${b.leaves}文件 ${st}`;
+      let txt = `#${i + 1} [${b.relPath || '/'}] ${b.items.length}项/${b.nodes || b.leaves}节点/${b.leaves}文件 ${st}`;
+      if (b.error) txt += ` — ${b.error}`;
+      lbl.textContent = txt;
       if (b.error) lbl.title = b.error;
       row.appendChild(lbl);
       if (b.status === 'failed' || b.status === 'pending') {
         row.appendChild(mkBtn('重试', () => rerunBatch(b)));
-      }
-      if (b.status === 'failed') {
-        row.appendChild(mkBtn('拆半', () => { if (splitBatch(b)) renderBatches(); }));
       }
       box.appendChild(row);
     });
